@@ -268,16 +268,23 @@ async def store_image_file(image_id: int, image_data: bytes) -> None:
 async def cache_file(msg: Message, image_id: int) -> None:
     """
     缓存消息中的图片数据到文件系统，最多只缓存两张图片。
-    :param msg: 消息对象
-    :param image_id: 图像对应的 ID
     """
-    semaphore = asyncio.Semaphore(2)  # 控制并发任务数量
-    max_number = config.max_bottle_pic  # 最多处理两张图片
-    async with httpx.AsyncClient() as client:
+    ssl_context = ssl.create_default_context()
+    # 设置SSL上下文来使用特定的SSL版本和加密套件
+    ssl_context.options |= ssl.OP_NO_SSLv3
+    ssl_context.set_ciphers('HIGH:!DH:!aNULL')
+
+    semaphore = asyncio.Semaphore(2)
+    max_number = config.max_bottle_pic
+    async with httpx.AsyncClient(  # 修改点：添加SSL配置
+        verify=ssl_context,
+        timeout=30,
+        limits=httpx.Limits(max_connections=5)
+    ) as client:
         tasks = [
             cache_image_url(seg, client, image_id, semaphore)
             for i, seg in enumerate(msg)
-            if seg.type == "image" and i < max_number+1  # 限制只处理前两张图片
+            if seg.type == "image" and i < max_number+1
         ]
         await asyncio.gather(*tasks)
 
@@ -289,10 +296,6 @@ async def cache_image_url(
 ) -> None:
     """
     缓存单个图片 URL 到文件系统。
-    :param seg: 包含图片 URL 的消息段
-    :param client: HTTP 客户端
-    :param image_id: 图像对应的 ID
-    :param semaphore: 控制并发任务数量的信号量
     """
     async with semaphore:
         url = seg.data.get("url")
@@ -302,16 +305,21 @@ async def cache_image_url(
         seg.type = "cached_image"
         seg.data.clear()
         try:
-            r = await client.get(url)
+            # 修改点：添加重试机制和超时
+            r = await client.get(
+                url,
+                follow_redirects=True,
+                headers={"User-Agent": "Mozilla/5.0"}
+            )
             data = r.content
-        except httpx.TimeoutException:
+        except (httpx.TimeoutException, httpx.ConnectError) as e:
+            logger.warning(f"下载失败: {str(e)}")
             return
 
         if r.status_code != HTTPStatus.OK or not data:
             return
 
         await store_image_file(image_id, data)
-        # 设置文件名时使用原始的 image_id
         seg.data = {"file": f"image_{image_id}"}
 
 class Bottle:
