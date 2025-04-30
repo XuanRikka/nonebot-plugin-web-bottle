@@ -3,7 +3,7 @@ from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import padding
 import aiofiles
 import httpx
-
+import ssl
 from nonebot.adapters.onebot.v11 import Message, MessageSegment
 from nonebot import get_app, get_driver, require
 from nonebot.log import logger
@@ -28,7 +28,7 @@ from sqlite3 import Connection
 from http import HTTPStatus
 from pathlib import Path
 from io import BytesIO
-from PIL import Image
+from PIL import Image,ImageSequence
 import secrets
 import asyncio
 import hashlib
@@ -233,13 +233,14 @@ class NotSupportMessageError(Exception):
         return super().__str__()
 
 
+
 async def store_image_file(image_id: int, image_data: bytes) -> None:
     """
     存储图像数据到文件系统，使用有损压缩减小文件大小。
+    如果是动图，则保存为动态 WebP，否则保存静态 WebP。
     :param image_id: 图像对应的 ID
     :param image_data: 图像的二进制数据
     """
-    # 将二进制数据转换为Image对象
     image = Image.open(BytesIO(image_data))
 
     # 创建以 image_id 为名的子文件夹
@@ -248,35 +249,49 @@ async def store_image_file(image_id: int, image_data: bytes) -> None:
 
     # 找到子文件夹中最大索引值，生成下一个文件名
     existing_files = list(folder.glob("*.webp"))
-    max_index = -1  # 初始为-1，如果没有文件则从0开始
+    max_index = -1
     for file in existing_files:
         try:
-            # 提取文件名中的数字索引
-            index = int(file.stem)  # 去掉文件扩展名后解析为整数
+            index = int(file.stem)
             max_index = max(max_index, index)
         except ValueError:
-            continue  # 忽略无法解析为数字的文件名
+            continue
+    next_index = max_index + 1
 
-    next_index = max_index + 1  # 下一个文件名的索引
-
-    # 保存图片
     output_file = folder / f"{next_index}.webp"
-    image.save(output_file, format='WEBP', quality=80)  # 调整quality值以平衡质量和大小
-    logger.info(f"图像 ID {image_id} 成功保存为 {output_file}")
 
+    # 判断是否为动图
+    is_animated = getattr(image, "is_animated", False) or getattr(image, "n_frames", 1) > 1
+    if is_animated:
+        # 收集所有帧
+        frames = [frame.copy() for frame in ImageSequence.Iterator(image)]
+        # 保存为动态 WebP
+        frames[0].save(
+            output_file,
+            format='WEBP',
+            save_all=True,
+            append_images=frames[1:],
+            duration=image.info.get('duration', 100),
+            loop=0,
+            quality=80
+        )
+    else:
+        # 保存静态 WebP
+        image.save(output_file, format='WEBP', quality=80)
+
+    logger.info(f"图像 ID {image_id} 成功保存为 {output_file}")
 
 async def cache_file(msg: Message, image_id: int) -> None:
     """
     缓存消息中的图片数据到文件系统，最多只缓存两张图片。
     """
     ssl_context = ssl.create_default_context()
-    # 设置SSL上下文来使用特定的SSL版本和加密套件
     ssl_context.options |= ssl.OP_NO_SSLv3
     ssl_context.set_ciphers('HIGH:!DH:!aNULL')
 
     semaphore = asyncio.Semaphore(2)
     max_number = config.max_bottle_pic
-    async with httpx.AsyncClient(  # 修改点：添加SSL配置
+    async with httpx.AsyncClient(
         verify=ssl_context,
         timeout=30,
         limits=httpx.Limits(max_connections=5)
@@ -284,15 +299,15 @@ async def cache_file(msg: Message, image_id: int) -> None:
         tasks = [
             cache_image_url(seg, client, image_id, semaphore)
             for i, seg in enumerate(msg)
-            if seg.type == "image" and i < max_number+1
+            if seg.type == "image" and i < max_number
         ]
         await asyncio.gather(*tasks)
 
 async def cache_image_url(
-        seg: MessageSegment,
-        client: httpx.AsyncClient,
-        image_id: int,
-        semaphore: asyncio.Semaphore,
+    seg: MessageSegment,
+    client: httpx.AsyncClient,
+    image_id: int,
+    semaphore: asyncio.Semaphore,
 ) -> None:
     """
     缓存单个图片 URL 到文件系统。
@@ -305,7 +320,6 @@ async def cache_image_url(
         seg.type = "cached_image"
         seg.data.clear()
         try:
-            # 修改点：添加重试机制和超时
             r = await client.get(
                 url,
                 follow_redirects=True,
